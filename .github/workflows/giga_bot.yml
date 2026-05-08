@@ -1,0 +1,54 @@
+name: Gigaverse Telegram Bot
+
+on:
+  schedule:
+    - cron: '30 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: giga-telegram-bot
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Telegram command bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GIGA_SECRET_KEY: ${{ secrets.GIGA_SECRET_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GIGAVERSE_BASE_URL: ${{ secrets.GIGAVERSE_BASE_URL }}
+        run: python giga_tg_bot.py bot --duration 20700
+
+      - name: Self restart
+        if: always() && github.event_name == 'workflow_dispatch'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/giga_bot.yml/dispatches" \
+            -d "{\"ref\":\"${{ github.ref_name }}\"}" \
+            && echo "Next bot run triggered" \
+            || echo "Self restart failed; cron will catch it"

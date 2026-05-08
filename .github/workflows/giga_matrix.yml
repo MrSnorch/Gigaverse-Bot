@@ -1,0 +1,101 @@
+name: Gigaverse Matrix Workers
+
+on:
+  workflow_dispatch:
+    inputs:
+      single_user:
+        description: "Optional Telegram user id to run alone"
+        required: false
+        default: ""
+  schedule:
+    - cron: "7 */6 * * *"
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: giga-matrix
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      has_users: ${{ steps.matrix.outputs.has_users }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build active user matrix
+        id: matrix
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SINGLE_USER: ${{ inputs.single_user }}
+        run: python giga_tg_bot.py matrix --single-user "$SINGLE_USER"
+
+  worker:
+    needs: prepare
+    if: needs.prepare.outputs.has_users == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    concurrency:
+      group: giga-user-${{ matrix.telegram_id }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run user worker
+        id: worker
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GIGA_SECRET_KEY: ${{ secrets.GIGA_SECRET_KEY }}
+          GIGAVERSE_BASE_URL: ${{ secrets.GIGAVERSE_BASE_URL }}
+        run: |
+          set +e
+          python giga_tg_bot.py worker --user "${{ matrix.telegram_id }}" --duration 20700 --interval 2
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Retry rate-limited worker
+        if: steps.worker.outputs.exit_code == '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run giga_matrix.yml -f single_user="${{ matrix.telegram_id }}"
+
+  restart:
+    needs:
+      - prepare
+      - worker
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.single_user == '' && needs.prepare.outputs.has_users == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Keep long polling alive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run giga_matrix.yml
