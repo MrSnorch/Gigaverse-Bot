@@ -8,6 +8,8 @@ The project is designed for an open GitHub repository: no bearer tokens, Telegra
 
 - Starts one run or a batch of runs from Telegram.
 - Shows live battle/account status in a pinned Telegram message.
+- Keeps run events in that pinned message instead of spamming new chat notifications.
+- Shows last-run loot drops, estimated floor value, and 24h run stats in the pinned message.
 - Lets every user configure their own bearer token, wallet address, dungeon, gear IDs, run count, delay, auto-continue, and loot mode.
 - Runs users in GitHub Actions with a matrix, so each active Telegram user gets a separate worker job.
 - Stores debug data for every run in Supabase so combat and loot behavior can be analyzed later.
@@ -37,6 +39,7 @@ Add these in GitHub: `Settings -> Secrets and variables -> Actions`.
 | `SUPABASE_URL` | Project URL from Supabase. |
 | `SUPABASE_SERVICE_KEY` | Supabase service role key. Required. Do not use the anon key here. |
 | `GIGAVERSE_BASE_URL` | Optional. Defaults to `https://gigaverse.io`. |
+| `ETH_USDC_RATE` | Optional fixed ETH to USDC rate. If omitted, the bot tries Coinbase spot when valuing loot. |
 
 Optional extra secret:
 
@@ -59,6 +62,7 @@ The schema creates:
 - `giga_users` - Telegram users, settings, pinned message state.
 - `giga_user_secrets` - bearer tokens only. RLS is enabled and no public read policy is created.
 - `giga_debug_runs` - sanitized combat/loot/debug history for analysis.
+- `giga_debug_turns` - full turn-by-turn combat history. This prevents long `combat_log` cells from being truncated in exports.
 - `giga_bot_state` - Telegram polling offset.
 
 Row Level Security is enabled and no public policies are added. The bot uses `SUPABASE_SERVICE_KEY` only from GitHub Actions secrets.
@@ -120,11 +124,14 @@ Every finished run is saved to `giga_debug_runs` with:
 
 - account snapshot
 - run settings snapshot without bearer token
-- combat log
+- compact tail of the combat log
 - enemy move history
 - loot choices
 - drops
+- loot floor value estimate
 - final status
+
+Every combat turn is also saved to `giga_debug_turns`, linked by `run_row_id`. Use that table for detailed fight analysis.
 
 This is the main database for improving battle and loot logic across all users.
 
@@ -132,7 +139,7 @@ This is the main database for improving battle and loot logic across all users.
 
 - This is a separate GitHub/Telegram version, not a full copy of the local browser UI.
 - Combat and loot logic are intentionally compact but already include charge conservation, boss aggression, Magic deprioritization, AddMaxHealth priority, and debug logging.
-- Marketplace/inventory valuation is not included yet.
+- Loot value uses marketplace floor prices from Gigaverse. Items without a floor are shown as unpriced.
 - GitHub runners are not real-time servers. The pinned message is updated often while a worker is alive, but Telegram commands are processed by the controller workflow.
 
 ## Local Test

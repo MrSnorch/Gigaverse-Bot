@@ -24,7 +24,8 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import requests
@@ -47,6 +48,7 @@ LOOT_ACTIONS = ("loot_one", "loot_two", "loot_three")
 RUN_TABLE = "giga_users"
 SECRET_TABLE = "giga_user_secrets"
 DEBUG_TABLE = "giga_debug_runs"
+TURN_TABLE = "giga_debug_turns"
 STATE_TABLE = "giga_bot_state"
 
 
@@ -78,6 +80,8 @@ DEFAULT_STATE: dict[str, Any] = {
     "last_streak": 0,
     "enemy_history": [],
     "move_cooldowns": [],
+    "activity_log": [],
+    "last_run_summary": {},
     "debug": None,
     "last_error": "",
     "last_status_at": "",
@@ -180,7 +184,7 @@ def sb_get(table: str, params: dict[str, str] | None = None) -> list[dict[str, A
     return response.json()
 
 
-def sb_post(table: str, payload: dict[str, Any], *, prefer: str = "return=representation") -> list[dict[str, Any]]:
+def sb_post(table: str, payload: Any, *, prefer: str = "return=representation") -> list[dict[str, Any]]:
     response = requests.post(sb_url(table), headers=sb_headers(prefer=prefer), json=payload, timeout=20)
     if not response.ok:
         raise ApiError(f"Supabase POST {table}: {response.status_code} {response.text[:300]}")
@@ -279,7 +283,66 @@ def save_bot_offset(offset: int) -> None:
 
 def save_debug_run(telegram_id: int, payload: dict[str, Any]) -> None:
     safe = sanitize_debug(payload)
-    sb_post(DEBUG_TABLE, {"telegram_id": telegram_id, **safe}, prefer="return=minimal")
+    rows = sb_post(DEBUG_TABLE, {"telegram_id": telegram_id, **safe}, prefer="return=representation")
+    run_row_id = int((rows[0] if rows else {}).get("id") or 0)
+    if run_row_id:
+        save_debug_turns(
+            telegram_id=telegram_id,
+            run_row_id=run_row_id,
+            external_run_id=str(safe.get("external_run_id") or ""),
+            turns=payload.get("combat_log") or [],
+        )
+
+
+def save_debug_turns(telegram_id: int, run_row_id: int, external_run_id: str, turns: list[dict[str, Any]]) -> None:
+    rows: list[dict[str, Any]] = []
+    for index, turn in enumerate(turns, start=1):
+        compact = compact_turn(turn)
+        rows.append(
+            {
+                "telegram_id": telegram_id,
+                "run_row_id": run_row_id,
+                "external_run_id": external_run_id,
+                "turn_index": index,
+                "room": compact.get("room"),
+                "floor": compact.get("floor"),
+                "enemy_id": compact.get("enemy_id"),
+                "our_move": compact.get("our_move"),
+                "enemy_move": compact.get("enemy_move"),
+                "result": compact.get("result"),
+                "before_state": compact.get("before") or {},
+                "after_state": compact.get("after") or {},
+                "decision": compact.get("decision") or {},
+            }
+        )
+    for start in range(0, len(rows), 100):
+        sb_post(TURN_TABLE, rows[start : start + 100], prefer="return=minimal")
+
+
+def compact_turn(turn: dict[str, Any]) -> dict[str, Any]:
+    decision = turn.get("decision") or {}
+    scores = decision.get("scores") or {}
+    compact_scores = {move: round(float(score), 3) for move, score in scores.items() if move in MOVES}
+    return {
+        "at": turn.get("at"),
+        "room": turn.get("room"),
+        "floor": turn.get("floor"),
+        "enemy_id": turn.get("enemy_id"),
+        "our_move": turn.get("our_move"),
+        "enemy_move": turn.get("enemy_move"),
+        "result": turn.get("result"),
+        "before": turn.get("before") or {},
+        "after": turn.get("after") or {},
+        "decision": {
+            "scores": compact_scores,
+            "recent": decision.get("recent"),
+            "predicted": decision.get("predicted"),
+            "predicted_confidence": decision.get("predicted_confidence"),
+            "enemy_available": decision.get("enemy_available") or [],
+            "magic_underbuilt": bool(decision.get("magic_underbuilt")),
+            "projection": decision.get("projection") or {},
+        },
+    }
 
 
 def sanitize_debug(payload: dict[str, Any]) -> dict[str, Any]:
@@ -297,8 +360,9 @@ def sanitize_debug(payload: dict[str, Any]) -> dict[str, Any]:
         "draws": int(payload.get("draws") or 0),
         "loot": payload.get("loot") or [],
         "drops": payload.get("drops") or [],
+        "loot_value": payload.get("loot_value") or {},
         "enemy_report": payload.get("enemy_report") or {},
-        "combat_log": payload.get("combat_log") or [],
+        "combat_log": [compact_turn(turn) for turn in (payload.get("combat_log") or [])[-12:]],
         "account_snapshot": payload.get("account_snapshot") or {},
         "settings_snapshot": settings,
     }
@@ -485,6 +549,9 @@ class GigaverseClient:
 
     def get_energy(self, address: str) -> dict[str, Any]:
         return self.request("GET", f"/api/offchain/player/energy/{address}")
+
+    def get_marketplace_floor_all(self) -> dict[str, Any]:
+        return self.request("GET", "/api/marketplace/item/floor/all")
 
     def get_dungeon_state(self) -> dict[str, Any]:
         return self.request("GET", "/api/game/dungeon/state")
@@ -756,6 +823,17 @@ def room_floor(room: int) -> int:
     return max(1, (max(room, 1) - 1) // 4 + 1)
 
 
+def room_on_floor(room: int) -> int:
+    return ((max(room, 1) - 1) % 4) + 1
+
+
+def format_floor_room(room: int | None) -> str:
+    value = int(room or 0)
+    if value <= 0:
+        return "floor - room=-"
+    return f"floor {room_floor(value)} room={room_on_floor(value)}"
+
+
 def combatant_line(name: str, player: dict[str, Any]) -> str:
     hp, hp_max = health(player)
     sh, sh_max = shield(player)
@@ -802,16 +880,37 @@ def format_status(user: dict[str, Any], snapshot: dict[str, Any], dungeon_payloa
     game = snapshot.get("game") or {}
     run = ((dungeon_payload or {}).get("data") or {}).get("run") or {}
     entity = ((dungeon_payload or {}).get("data") or {}).get("entity") or {}
+    try:
+        daily = get_daily_run_stats(int(user["telegram_id"]))
+    except Exception as exc:  # noqa: BLE001
+        LOG.info("Daily stats unavailable: %s", exc)
+        daily = {"runs": 0, "completed": 0, "defeated": 0, "best_label": "-", "loot_value": {}}
+    last_run = state.get("last_run_summary") or {}
     lines = [
         "<b>Gigaverse Control</b>",
-        f"User: <code>{e(user.get('telegram_id'))}</code>",
-        f"Wallet: <code>{e(short_address(snapshot.get('address')))}</code>",
-        f"Noob: <b>{e(snapshot.get('noob_id') or '-')}</b>",
-        f"Energy: <b>{e(energy.get('current'))}/{e(energy.get('max'))}</b> | regen/h {e(energy.get('regen_per_hour') or '-')}",
-        f"Can enter: <b>{e(game.get('can_enter_game'))}</b> | Pass: {e(game.get('noob_pass_balance') or '-')}",
-        f"Dungeon: {e(settings.get('dungeon_id'))} | Gear: {e(', '.join(map(str, settings.get('gear_instance_ids') or [])) or '-')}",
-        f"Active: <b>{'yes' if user.get('active') else 'no'}</b> | Runs left: {e(state.get('runs_remaining') or 0)}",
+        f"Bot: <b>{'running' if user.get('active') else 'stopped'}</b> | Runs left: {e(state.get('runs_remaining') or 0)}",
+        f"Wallet: <code>{e(short_address(snapshot.get('address')))}</code> | Noob <b>{e(snapshot.get('noob_id') or '-')}</b>",
+        f"Energy: <b>{e(energy.get('current') or '-')}/{e(energy.get('max') or '-')}</b> | regen/h {e(energy.get('regen_per_hour') or '-')}",
+        f"Can enter: <b>{e(game.get('can_enter_game'))}</b> | Dungeon {e(settings.get('dungeon_id'))}",
+        "",
+        "<b>Last 24h</b>",
+        f"Runs: <b>{e(daily.get('runs'))}</b> | completed {e(daily.get('completed'))} | defeated {e(daily.get('defeated'))}",
+        f"Best: <b>{e(daily.get('best_label'))}</b> | Loot value {e(format_loot_value(daily.get('loot_value')))}",
     ]
+    if last_run:
+        loot_value = last_run.get("loot_value") or {}
+        lines += [
+            "",
+            "<b>Last run</b>",
+            e(last_run.get("message") or f"Run finished: {last_run.get('status', '-')}")
+            + f" | Loot {e(format_loot_value(loot_value))}",
+        ]
+        loot_lines = list(loot_value.get("lines") or [])
+        if loot_lines:
+            lines += [e(" • ".join(loot_lines[:4]))]
+        picks = list(last_run.get("loot_picks") or [])
+        if picks:
+            lines += [f"Boons: {e(' | '.join(picks[:4]))}"]
     if run:
         players = run.get("players") or [{}, {}]
         me = players[0] if players else {}
@@ -820,12 +919,16 @@ def format_status(user: dict[str, Any], snapshot: dict[str, Any], dungeon_payloa
         enemy_name = str(entity.get("ENEMY_CID") or "Enemy")
         lines += [
             "",
-            f"<b>Live battle</b> Floor {room_floor(room)} Room {room}",
+            f"<b>Live battle</b> {format_floor_room(room)}",
             combatant_line("You", me),
             combatant_line(enemy_name, enemy),
         ]
     else:
         lines += ["", "<b>Live battle</b>: idle"]
+    events = activity_lines(state)
+    if events:
+        lines += ["", "<b>Events</b>"]
+        lines += [e(line) for line in events]
     if state.get("last_error"):
         lines += ["", f"Last error: <code>{e(state.get('last_error'))}</code>"]
     lines.append(f"\nUpdated: {datetime.now().strftime('%m-%d %H:%M:%S')}")
@@ -837,6 +940,219 @@ def short_address(address: Any) -> str:
     if len(value) <= 12:
         return value or "-"
     return f"{value[:6]}...{value[-4:]}"
+
+
+def append_activity(state: dict[str, Any], text: str) -> dict[str, Any]:
+    events = list(state.get("activity_log") or [])
+    events.insert(0, {"at": utc_now(), "text": text})
+    state["activity_log"] = events[:8]
+    return state
+
+
+def activity_lines(state: dict[str, Any], limit: int = 4) -> list[str]:
+    rows: list[str] = []
+    for event in list(state.get("activity_log") or [])[:limit]:
+        at = str((event or {}).get("at") or "")
+        label = str((event or {}).get("text") or "").strip()
+        if not label:
+            continue
+        try:
+            stamp = datetime.fromisoformat(at.replace("Z", "+00:00")).strftime("%H:%M")
+        except ValueError:
+            stamp = "--:--"
+        rows.append(f"{stamp} {label}")
+    return rows
+
+
+def _maybe_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_decimal(value: Any) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def wei_to_eth_decimal(value: int) -> Decimal:
+    return Decimal(value) / Decimal(10**18)
+
+
+def wei_to_eth_str(value: int | None) -> str:
+    if value is None:
+        return "-"
+    amount = wei_to_eth_decimal(int(value))
+    if amount == 0:
+        return "0"
+    return f"{amount:.6f}".rstrip("0").rstrip(".")
+
+
+def format_loot_value(value: dict[str, Any] | None) -> str:
+    data = value or {}
+    total_wei = _maybe_int(data.get("total_wei")) or 0
+    if total_wei <= 0:
+        unpriced = int(data.get("unpriced_items") or 0)
+        return "unpriced" if unpriced else "0"
+    eth = wei_to_eth_str(total_wei)
+    usdc = str(data.get("total_usdc") or "").strip()
+    if usdc:
+        return f"{eth} ETH / ${usdc}"
+    return f"{eth} ETH"
+
+
+def parse_jsonish(value: Any, default: Any) -> Any:
+    if value in (None, ""):
+        return default
+    if isinstance(value, (list, dict)):
+        return value
+    try:
+        return json.loads(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_floor_prices(payload: Any) -> dict[int, int]:
+    entities = payload.get("entities") if isinstance(payload, dict) else None
+    if not isinstance(entities, list):
+        return {}
+    rows: dict[int, int] = {}
+    for entity in entities:
+        if not isinstance(entity, dict):
+            continue
+        item_id = _maybe_int(entity.get("GAME_ITEM_ID_CID"))
+        price = _maybe_int(entity.get("ETH_MINT_PRICE_CID"))
+        if item_id is not None and price is not None:
+            rows[item_id] = price
+    return rows
+
+
+def fetch_eth_usdc_rate() -> Decimal | None:
+    configured = _safe_decimal(os.environ.get("ETH_USDC_RATE"))
+    if configured and configured > 0:
+        return configured
+    try:
+        response = requests.get("https://api.coinbase.com/v2/prices/ETH-USDC/spot", timeout=8)
+        if not response.ok:
+            return None
+        amount = _safe_decimal(((response.json() or {}).get("data") or {}).get("amount"))
+        return amount if amount and amount > 0 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def aggregate_drops(drops: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    totals: dict[int, dict[str, Any]] = {}
+    for drop in drops:
+        item_id = _maybe_int(drop.get("item_id") or (drop.get("raw") or {}).get("id"))
+        amount = _maybe_int(drop.get("amount")) or 0
+        if item_id is None or amount <= 0:
+            continue
+        row = totals.setdefault(item_id, {"item_id": item_id, "amount": 0, "rarity": drop.get("rarity")})
+        row["amount"] += amount
+        if row.get("rarity") is None:
+            row["rarity"] = drop.get("rarity")
+    return sorted(totals.values(), key=lambda row: (-int(row["amount"]), int(row["item_id"])))
+
+
+def value_run_drops(client: GigaverseClient, drops: list[dict[str, Any]]) -> dict[str, Any]:
+    items = aggregate_drops(drops)
+    floor_prices: dict[int, int] = {}
+    try:
+        floor_prices = normalize_floor_prices(client.get_marketplace_floor_all())
+    except Exception as exc:  # noqa: BLE001
+        LOG.info("Loot value floor fetch failed: %s", exc)
+    total_wei = 0
+    priced_items = 0
+    unpriced_items = 0
+    lines: list[str] = []
+    for row in items:
+        item_id = int(row["item_id"])
+        amount = int(row["amount"])
+        floor_wei = floor_prices.get(item_id, 0)
+        value_wei = floor_wei * amount
+        if value_wei > 0:
+            total_wei += value_wei
+            priced_items += 1
+            suffix = f" ({wei_to_eth_str(value_wei)} ETH)"
+        else:
+            unpriced_items += 1
+            suffix = ""
+        lines.append(f"Item #{item_id} +{amount}{suffix}")
+    rate = fetch_eth_usdc_rate()
+    total_usdc = ""
+    if rate and total_wei > 0:
+        total_usdc = f"{(wei_to_eth_decimal(total_wei) * rate):.2f}"
+    return {
+        "items": items,
+        "lines": lines[:6],
+        "total_wei": str(total_wei),
+        "total_eth": wei_to_eth_str(total_wei),
+        "total_usdc": total_usdc,
+        "priced_items": priced_items,
+        "unpriced_items": unpriced_items,
+    }
+
+
+def build_run_summary(debug: dict[str, Any], client: GigaverseClient | None = None) -> dict[str, Any]:
+    room = int(debug.get("rooms_cleared") or 0)
+    status = str(debug.get("status") or "unknown")
+    loot_value = {"lines": [], "total_wei": "0", "total_eth": "0", "total_usdc": "", "unpriced_items": 0}
+    if client is not None:
+        loot_value = value_run_drops(client, list(debug.get("drops") or []))
+    return {
+        "status": status,
+        "rooms_cleared": room,
+        "floor": room_floor(room) if room else 0,
+        "room_on_floor": room_on_floor(room) if room else 0,
+        "message": f"Run finished: {status} {format_floor_room(room)}",
+        "loot_value": loot_value,
+        "loot_picks": [
+            f"R{row.get('room')}:{row.get('boon')}({row.get('v1')},{row.get('v2')})"
+            for row in list(debug.get("loot") or [])[-6:]
+        ],
+    }
+
+
+def get_daily_run_stats(telegram_id: int) -> dict[str, Any]:
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    rows = sb_get(
+        DEBUG_TABLE,
+        {
+            "telegram_id": f"eq.{telegram_id}",
+            "created_at": f"gte.{since}",
+            "select": "status,rooms_cleared,loot_value",
+        },
+    )
+    best_room = 0
+    completed = 0
+    defeated = 0
+    total_wei = 0
+    for row in rows:
+        room = int(row.get("rooms_cleared") or 0)
+        best_room = max(best_room, room)
+        status = str(row.get("status") or "")
+        if status == "completed":
+            completed += 1
+        elif status:
+            defeated += 1
+        value = parse_jsonish(row.get("loot_value"), {})
+        total_wei += _maybe_int(value.get("total_wei") if isinstance(value, dict) else None) or 0
+    return {
+        "runs": len(rows),
+        "completed": completed,
+        "defeated": defeated,
+        "best_room": best_room,
+        "best_label": format_floor_room(best_room) if best_room else "-",
+        "loot_value": {"total_wei": str(total_wei), "total_eth": wei_to_eth_str(total_wei)},
+    }
 
 
 def upsert_pinned_status(user: dict[str, Any], text: str) -> dict[str, Any]:
@@ -862,6 +1178,18 @@ def live_status_for_user(user: dict[str, Any]) -> str:
     snapshot = account_snapshot(client, settings)
     dungeon = client.get_dungeon_state()
     return format_status(user, snapshot, dungeon)
+
+
+def refresh_pinned_for_user(user: dict[str, Any]) -> None:
+    telegram_id = int(user["telegram_id"])
+    try:
+        if stored_bearer_value(user):
+            text = live_status_for_user(user)
+        else:
+            text = format_status(user, {}, None)
+        upsert_pinned_status(user, text)
+    except Exception as exc:  # noqa: BLE001
+        LOG.info("Pinned status refresh failed for %s: %s", telegram_id, exc)
 
 
 def command_help() -> str:
@@ -949,8 +1277,10 @@ def handle_simple_setting(message: dict[str, Any], text: str) -> None:
     else:
         send(telegram_id, "Unknown setting command.")
         return
-    update_user(telegram_id, settings=settings)
-    send(telegram_id, "Settings saved.", reply_markup=settings_keyboard(settings))
+    state = deep_merge(DEFAULT_STATE, user.get("state") or {})
+    state = append_activity(state, "Settings saved")
+    update_user(telegram_id, settings=settings, state=state)
+    refresh_pinned_for_user(user | {"settings": settings, "state": state})
 
 
 def request_run(user: dict[str, Any], runs: int) -> None:
@@ -961,9 +1291,10 @@ def request_run(user: dict[str, Any], runs: int) -> None:
     state["command"] = {"action": "start", "runs": runs, "created_at": utc_now()}
     state["runs_remaining"] = runs
     state["last_error"] = ""
+    state = append_activity(state, f"Start requested: {runs} run(s)")
     update_user(telegram_id, active=True, state=state)
     dispatch_matrix_for_user(telegram_id)
-    send(telegram_id, f"Start requested: {runs} run(s). Matrix worker will pick it up.", reply_markup=main_keyboard())
+    refresh_pinned_for_user(user | {"active": True, "state": state})
 
 
 def handle_run(message: dict[str, Any], text: str) -> None:
@@ -977,8 +1308,9 @@ def handle_stop(message: dict[str, Any]) -> None:
     user = ensure_user(message.get("from") or {})
     state = deep_merge(DEFAULT_STATE, user.get("state") or {})
     state["command"] = {"action": "stop", "created_at": utc_now()}
+    state = append_activity(state, "Stop requested")
     update_user(int(user["telegram_id"]), active=False, state=state)
-    send(int(user["telegram_id"]), "Stop requested.", reply_markup=main_keyboard())
+    refresh_pinned_for_user(user | {"active": False, "state": state})
 
 
 def handle_status(message: dict[str, Any]) -> None:
@@ -990,7 +1322,6 @@ def handle_status(message: dict[str, Any]) -> None:
     try:
         text = live_status_for_user(user)
         upsert_pinned_status(user, text)
-        send(chat_id, "Status refreshed.", reply_markup=main_keyboard(), silent=True)
     except Exception as exc:  # noqa: BLE001
         send(chat_id, f"Status failed: <code>{e(exc)}</code>")
 
@@ -1107,13 +1438,16 @@ def start_debug(settings: dict[str, Any], response: dict[str, Any]) -> dict[str,
 
 def append_drops(debug: dict[str, Any], response: dict[str, Any], room: int, action: str) -> None:
     for change in response.get("gameItemBalanceChanges") or []:
+        item_id = change.get("itemId") or change.get("itemID") or change.get("id")
         debug.setdefault("drops", []).append(
             {
                 "at": utc_now(),
                 "room": room,
                 "action": action,
-                "item_id": change.get("itemId") or change.get("itemID"),
+                "item_id": item_id,
                 "amount": change.get("amount") or change.get("delta") or change.get("value"),
+                "rarity": change.get("rarity"),
+                "gear_instance_id": change.get("gearInstanceId") or "",
                 "raw": change,
             }
         )
@@ -1135,8 +1469,9 @@ def tick_worker(user: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         state["command"] = None
         state["runs_remaining"] = 0
         state["last_error"] = ""
+        state = append_activity(state, "Worker stopped")
         update_user(telegram_id, state=state, active=False)
-        send(telegram_id, "Worker stopped.", reply_markup=main_keyboard())
+        refresh_pinned_for_user(user | {"state": state, "active": False})
         return state, False
     if command.get("action") == "start":
         state["runs_remaining"] = max(1, int(command.get("runs") or state.get("runs_remaining") or 1))
@@ -1158,13 +1493,11 @@ def tick_worker(user: dict[str, Any]) -> tuple[dict[str, Any], bool]:
                 debug["account_snapshot"] = account
             except Exception:
                 account = {}
+            summary = build_run_summary(debug, client)
+            debug["loot_value"] = summary.get("loot_value") or {}
+            state["last_run_summary"] = summary
+            state = append_activity(state, str(summary.get("message") or "Run finished"))
             save_debug_run(telegram_id, debug)
-            send(
-                telegram_id,
-                f"Run finished: <b>{e(debug['status'])}</b> rooms={e(debug.get('rooms_cleared'))} "
-                f"W/L/D={e(debug.get('wins'))}/{e(debug.get('losses'))}/{e(debug.get('draws'))}",
-                reply_markup=main_keyboard(),
-            )
             state["debug"] = None
             state["current_run"] = None
             state["enemy_history"] = []
@@ -1183,7 +1516,7 @@ def tick_worker(user: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             run = run_data(response)
             entity = run_entity(response)
             append_drops(state["debug"], response, int(entity.get("ROOM_NUM_CID") or 1), "start_run")
-            send(telegram_id, "Run started.", reply_markup=main_keyboard())
+            state = append_activity(state, "Run started")
         else:
             try:
                 account = account_snapshot(client, settings)
@@ -1265,7 +1598,8 @@ def tick_worker(user: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             enemy_row = report.setdefault(enemy_key, {"turns": 0, "moves": {}, "wins": 0, "losses": 0, "draws": 0})
             enemy_row["turns"] += 1
             enemy_row["moves"][enemy_move or "?"] = enemy_row["moves"].get(enemy_move or "?", 0) + 1
-            enemy_row[result + "s"] = enemy_row.get(result + "s", 0) + 1
+            result_key = {"win": "wins", "loss": "losses", "draw": "draws"}.get(result, "draws")
+            enemy_row[result_key] = enemy_row.get(result_key, 0) + 1
             debug.setdefault("combat_log", []).append(
                 {
                     "at": utc_now(),

@@ -38,6 +38,7 @@ jobs:
           GIGA_SECRET_KEY: ${{ secrets.GIGA_SECRET_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
           GIGAVERSE_BASE_URL: ${{ secrets.GIGAVERSE_BASE_URL }}
+          ETH_USDC_RATE: ${{ secrets.ETH_USDC_RATE }}
         run: python giga_tg_bot.py bot --duration 20700
 
       - name: Self restart

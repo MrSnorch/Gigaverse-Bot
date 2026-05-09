@@ -58,10 +58,31 @@ create table if not exists giga_debug_runs (
     draws integer default 0,
     loot jsonb default '[]'::jsonb,
     drops jsonb default '[]'::jsonb,
+    loot_value jsonb default '{}'::jsonb,
     enemy_report jsonb default '{}'::jsonb,
     combat_log jsonb default '[]'::jsonb,
     account_snapshot jsonb default '{}'::jsonb,
     settings_snapshot jsonb default '{}'::jsonb,
+    created_at timestamptz default now()
+);
+
+alter table giga_debug_runs add column if not exists loot_value jsonb default '{}'::jsonb;
+
+create table if not exists giga_debug_turns (
+    id bigserial primary key,
+    run_row_id bigint references giga_debug_runs(id) on delete cascade,
+    telegram_id bigint references giga_users(telegram_id) on delete cascade,
+    external_run_id text default '',
+    turn_index integer not null,
+    room integer,
+    floor integer,
+    enemy_id text default '',
+    our_move text default '',
+    enemy_move text default '',
+    result text default '',
+    before_state jsonb default '{}'::jsonb,
+    after_state jsonb default '{}'::jsonb,
+    decision jsonb default '{}'::jsonb,
     created_at timestamptz default now()
 );
 
@@ -97,10 +118,14 @@ create trigger giga_bot_state_updated_at
 create index if not exists idx_giga_users_active on giga_users(active) where active = true;
 create index if not exists idx_giga_debug_runs_user_time on giga_debug_runs(telegram_id, created_at desc);
 create index if not exists idx_giga_debug_runs_status on giga_debug_runs(status);
+create index if not exists idx_giga_debug_turns_run on giga_debug_turns(run_row_id, turn_index);
+create index if not exists idx_giga_debug_turns_user_time on giga_debug_turns(telegram_id, created_at desc);
+create index if not exists idx_giga_debug_turns_enemy on giga_debug_turns(enemy_id, result);
 
 alter table giga_users enable row level security;
 alter table giga_user_secrets enable row level security;
 alter table giga_debug_runs enable row level security;
+alter table giga_debug_turns enable row level security;
 alter table giga_bot_state enable row level security;
 
 -- No public RLS policies are created intentionally.

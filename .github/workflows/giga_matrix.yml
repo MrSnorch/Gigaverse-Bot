@@ -75,6 +75,7 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GIGA_SECRET_KEY: ${{ secrets.GIGA_SECRET_KEY }}
           GIGAVERSE_BASE_URL: ${{ secrets.GIGAVERSE_BASE_URL }}
+          ETH_USDC_RATE: ${{ secrets.ETH_USDC_RATE }}
         run: |
           set +e
           python giga_tg_bot.py worker --user "${{ matrix.telegram_id }}" --duration 20700 --interval 2
