@@ -237,7 +237,8 @@ def save_user_secret(telegram_id: int, bearer_token: str) -> None:
 
 
 def stored_bearer_value(user: dict[str, Any]) -> str:
-    return str(user.get("bearer_token") or user.get("encrypted_bearer_token") or "")
+    secret = get_user_secret(int(user["telegram_id"]))
+    return str(secret.get("encrypted_bearer_token") or secret.get("bearer_token") or "")
 
 
 def ensure_user(message_from: dict[str, Any]) -> dict[str, Any]:
