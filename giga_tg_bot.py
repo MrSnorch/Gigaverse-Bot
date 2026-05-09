@@ -910,7 +910,7 @@ def format_status(user: dict[str, Any], snapshot: dict[str, Any], dungeon_payloa
         f"Wallet: <code>{e(short_address(snapshot.get('address')))}</code> | Noob <b>{e(snapshot.get('noob_id') or '-')}</b>",
         f"Energy: <b>{e(energy.get('current') or '-')}/{e(energy.get('max') or '-')}</b>"
         + (f" | {e(energy_thresholds_line(energy.get('current'), energy.get('regen_per_hour')))}" if energy_thresholds_line(energy.get('current'), energy.get('regen_per_hour')) else ""),
-        f"Can enter: <b>{e(game.get('can_enter_game'))}</b> | Dungeon {e(settings.get('dungeon_id'))}",
+        f"Dungeon {e(settings.get('dungeon_id'))}",
         "",
         "<b>Last 24h</b>",
         f"Runs: <b>{e(daily.get('runs'))}</b> | completed {e(daily.get('completed'))} | defeated {e(daily.get('defeated'))}",
@@ -1149,6 +1149,7 @@ def get_daily_run_stats(telegram_id: int) -> dict[str, Any]:
     completed = 0
     defeated = 0
     total_wei = 0
+    total_usdc = 0.0
     for row in rows:
         room = int(row.get("rooms_cleared") or 0)
         best_room = max(best_room, room)
@@ -1159,13 +1160,18 @@ def get_daily_run_stats(telegram_id: int) -> dict[str, Any]:
             defeated += 1
         value = parse_jsonish(row.get("loot_value"), {})
         total_wei += _maybe_int(value.get("total_wei") if isinstance(value, dict) else None) or 0
+        try:
+            total_usdc += float(value.get("total_usdc") or 0) if isinstance(value, dict) else 0
+        except (TypeError, ValueError):
+            pass
+    usdc_str = f"{total_usdc:.2f}" if total_usdc > 0 else ""
     return {
         "runs": len(rows),
         "completed": completed,
         "defeated": defeated,
         "best_room": best_room,
         "best_label": format_floor_room(best_room) if best_room else "-",
-        "loot_value": {"total_wei": str(total_wei), "total_eth": wei_to_eth_str(total_wei)},
+        "loot_value": {"total_wei": str(total_wei), "total_eth": wei_to_eth_str(total_wei), "total_usdc": usdc_str},
     }
 
 
