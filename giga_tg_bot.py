@@ -819,6 +819,29 @@ def run_data(payload: dict[str, Any]) -> dict[str, Any]:
     return (payload.get("data") or {}).get("run") or {}
 
 
+def energy_thresholds_line(current: int | None, regen_per_hour: int | None) -> str:
+    """Return next energy threshold times, e.g. '40 in 27m • 80 in 3h27m'."""
+    cur = int(current or 0)
+    rph = int(regen_per_hour or 0)
+    if rph <= 0:
+        return ""
+    thresholds = [40, 80, 120, 160, 200, 240]
+    parts = []
+    for t in thresholds:
+        if cur >= t:
+            continue
+        minutes = int(((t - cur) / rph) * 60)
+        if minutes < 60:
+            label = f"{minutes}m"
+        else:
+            h, m = divmod(minutes, 60)
+            label = f"{h}h{m:02d}m" if m else f"{h}h"
+        parts.append(f"{t} in {label}")
+        if len(parts) == 3:
+            break
+    return " • ".join(parts)
+
+
 def room_floor(room: int) -> int:
     return max(1, (max(room, 1) - 1) // 4 + 1)
 
@@ -831,7 +854,7 @@ def format_floor_room(room: int | None) -> str:
     value = int(room or 0)
     if value <= 0:
         return "floor - room=-"
-    return f"floor {room_floor(value)} room={room_on_floor(value)}"
+    return f"floor {room_floor(value)} room {room_on_floor(value)}"
 
 
 def combatant_line(name: str, player: dict[str, Any]) -> str:
@@ -890,7 +913,8 @@ def format_status(user: dict[str, Any], snapshot: dict[str, Any], dungeon_payloa
         "<b>Gigaverse Control</b>",
         f"Bot: <b>{'running' if user.get('active') else 'stopped'}</b> | Runs left: {e(state.get('runs_remaining') or 0)}",
         f"Wallet: <code>{e(short_address(snapshot.get('address')))}</code> | Noob <b>{e(snapshot.get('noob_id') or '-')}</b>",
-        f"Energy: <b>{e(energy.get('current') or '-')}/{e(energy.get('max') or '-')}</b> | regen/h {e(energy.get('regen_per_hour') or '-')}",
+        f"Energy: <b>{e(energy.get('current') or '-')}/{e(energy.get('max') or '-')}</b>"
+        + (f" | {e(energy_thresholds_line(energy.get('current'), energy.get('regen_per_hour')))}" if energy_thresholds_line(energy.get('current'), energy.get('regen_per_hour')) else ""),
         f"Can enter: <b>{e(game.get('can_enter_game'))}</b> | Dungeon {e(settings.get('dungeon_id'))}",
         "",
         "<b>Last 24h</b>",
@@ -905,12 +929,7 @@ def format_status(user: dict[str, Any], snapshot: dict[str, Any], dungeon_payloa
             e(last_run.get("message") or f"Run finished: {last_run.get('status', '-')}")
             + f" | Loot {e(format_loot_value(loot_value))}",
         ]
-        loot_lines = list(loot_value.get("lines") or [])
-        if loot_lines:
-            lines += [e(" • ".join(loot_lines[:4]))]
-        picks = list(last_run.get("loot_picks") or [])
-        if picks:
-            lines += [f"Boons: {e(' | '.join(picks[:4]))}"]
+
     if run:
         players = run.get("players") or [{}, {}]
         me = players[0] if players else {}
@@ -1496,6 +1515,7 @@ def tick_worker(user: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             summary = build_run_summary(debug, client)
             debug["loot_value"] = summary.get("loot_value") or {}
             state["last_run_summary"] = summary
+            state["last_error"] = ""
             state = append_activity(state, str(summary.get("message") or "Run finished"))
             save_debug_run(telegram_id, debug)
             state["debug"] = None
