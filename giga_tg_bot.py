@@ -820,26 +820,21 @@ def run_data(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def energy_thresholds_line(current: int | None, regen_per_hour: int | None) -> str:
-    """Return next energy threshold times, e.g. '40 in 27m • 80 in 3h27m'."""
+    """Return time until next run is possible, e.g. 'next run in 2h30m'."""
     cur = int(current or 0)
     rph = int(regen_per_hour or 0)
     if rph <= 0:
         return ""
-    thresholds = [40, 80, 120, 160, 200, 240]
-    parts = []
-    for t in thresholds:
-        if cur >= t:
-            continue
-        minutes = int(((t - cur) / rph) * 60)
-        if minutes < 60:
-            label = f"{minutes}m"
-        else:
-            h, m = divmod(minutes, 60)
-            label = f"{h}h{m:02d}m" if m else f"{h}h"
-        parts.append(f"{t} in {label}")
-        if len(parts) == 3:
-            break
-    return " • ".join(parts)
+    next_t = next((t for t in [40, 80, 120, 160, 200, 240] if t > cur), None)
+    if next_t is None:
+        return ""
+    minutes = int(((next_t - cur) / rph) * 60)
+    if minutes < 60:
+        label = f"{minutes}m"
+    else:
+        h, m = divmod(minutes, 60)
+        label = f"{h}h{m:02d}m" if m else f"{h}h"
+    return f"next run in {label}"
 
 
 def room_floor(room: int) -> int:
