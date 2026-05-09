@@ -35,7 +35,7 @@ LOG = logging.getLogger("giga-tg")
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}" if TG_TOKEN else ""
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 DEFAULT_BASE_URL = (os.environ.get("GIGAVERSE_BASE_URL") or "https://gigaverse.io").rstrip("/")
 
 MOVES = ("rock", "paper", "scissor")
@@ -45,6 +45,7 @@ COUNTERS = {"rock": "paper", "paper": "scissor", "scissor": "rock"}
 LOSES_TO = {winner: loser for loser, winner in COUNTERS.items()}
 LOOT_ACTIONS = ("loot_one", "loot_two", "loot_three")
 RUN_TABLE = "giga_users"
+SECRET_TABLE = "giga_user_secrets"
 DEBUG_TABLE = "giga_debug_runs"
 STATE_TABLE = "giga_bot_state"
 
@@ -195,7 +196,12 @@ def sb_patch(table: str, params: dict[str, str], payload: dict[str, Any]) -> boo
 
 def get_user(telegram_id: int) -> dict[str, Any] | None:
     rows = sb_get(RUN_TABLE, {"telegram_id": f"eq.{telegram_id}", "select": "*"})
-    return rows[0] if rows else None
+    if not rows:
+        return None
+    user = rows[0]
+    secret = get_user_secret(telegram_id)
+    user.update(secret)
+    return user
 
 
 def upsert_user(telegram_id: int, **fields: Any) -> dict[str, Any]:
@@ -210,6 +216,24 @@ def upsert_user(telegram_id: int, **fields: Any) -> dict[str, Any]:
 
 def update_user(telegram_id: int, **fields: Any) -> bool:
     return sb_patch(RUN_TABLE, {"telegram_id": f"eq.{telegram_id}"}, fields)
+
+
+def get_user_secret(telegram_id: int) -> dict[str, str]:
+    rows = sb_get(SECRET_TABLE, {"telegram_id": f"eq.{telegram_id}", "select": "bearer_token,encrypted_bearer_token"})
+    if not rows:
+        return {"bearer_token": "", "encrypted_bearer_token": ""}
+    return {
+        "bearer_token": str(rows[0].get("bearer_token") or ""),
+        "encrypted_bearer_token": str(rows[0].get("encrypted_bearer_token") or ""),
+    }
+
+
+def save_user_secret(telegram_id: int, bearer_token: str) -> None:
+    sb_post(
+        f"{SECRET_TABLE}?on_conflict=telegram_id",
+        {"telegram_id": telegram_id, "bearer_token": bearer_token, "encrypted_bearer_token": ""},
+        prefer="return=minimal,resolution=merge-duplicates",
+    )
 
 
 def stored_bearer_value(user: dict[str, Any]) -> str:
@@ -229,7 +253,6 @@ def ensure_user(message_from: dict[str, Any]) -> dict[str, Any]:
     }
     if not user:
         fields["active"] = False
-        fields["bearer_token"] = ""
     return upsert_user(telegram_id, **fields)
 
 
@@ -889,11 +912,9 @@ def save_bearer_from_message(message: dict[str, Any], raw_token: str) -> None:
     state = deep_merge(DEFAULT_STATE, user.get("state") or {})
     state["awaiting"] = ""
     state["last_error"] = ""
-    update_user(
-        int(user["telegram_id"]),
-        bearer_token=encrypt_secret(token),
-        state=state,
-    )
+    telegram_id = int(user["telegram_id"])
+    save_user_secret(telegram_id, encrypt_secret(token))
+    update_user(telegram_id, state=state)
     saved_as = "encrypted" if os.environ.get("GIGA_SECRET_KEY", "").strip() else "saved"
     send(chat_id, f"Bearer token {saved_as} in Supabase. Use /status or /run 1.", reply_markup=main_keyboard())
 

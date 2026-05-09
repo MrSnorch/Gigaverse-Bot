@@ -2,7 +2,7 @@
 
 Telegram bot + GitHub Actions workers for running Gigaverse dungeon runs from Telegram.
 
-The project is designed for an open GitHub repository: no bearer tokens, Telegram tokens, or Supabase keys are stored in the repo. User bearer tokens are stored in Supabase, and debug run rows are sanitized before they are written.
+The project is designed for an open GitHub repository: no bearer tokens, Telegram tokens, or Supabase keys are stored in the repo. User bearer tokens are stored in a separate locked Supabase table, and debug run rows are sanitized before they are written.
 
 ## What It Does
 
@@ -35,7 +35,7 @@ Add these in GitHub: `Settings -> Secrets and variables -> Actions`.
 | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | Token from BotFather. |
 | `SUPABASE_URL` | Project URL from Supabase. |
-| `SUPABASE_SERVICE_KEY` | Supabase service role key. Keep it secret. |
+| `SUPABASE_SERVICE_KEY` | Supabase service role key. Required. Do not use the anon key here. |
 | `GIGAVERSE_BASE_URL` | Optional. Defaults to `https://gigaverse.io`. |
 
 Optional extra secret:
@@ -56,11 +56,14 @@ Create a Supabase project and run `supabase_schema.sql` in the SQL editor.
 
 The schema creates:
 
-- `giga_users` - Telegram users, bearer tokens, settings, pinned message state.
+- `giga_users` - Telegram users, settings, pinned message state.
+- `giga_user_secrets` - bearer tokens only. RLS is enabled and no public read policy is created.
 - `giga_debug_runs` - sanitized combat/loot/debug history for analysis.
 - `giga_bot_state` - Telegram polling offset.
 
 Row Level Security is enabled and no public policies are added. The bot uses `SUPABASE_SERVICE_KEY` only from GitHub Actions secrets.
+
+Do not configure this bot with `SUPABASE_ANON_KEY`. It is intentionally a backend worker, so it uses the service role key from GitHub Secrets. Keep token data out of `giga_users`.
 
 ## Workflows
 
@@ -109,7 +112,7 @@ Use `/start` first.
 
 The bot deletes `/settoken` messages after saving when Telegram allows it.
 
-Users can also press `Set bearer token` in the inline keyboard. The bot then waits for the next message, accepts either `ey...` or `Bearer ey...`, deletes that message, normalizes it, and saves it to `giga_users.bearer_token`.
+Users can also press `Set bearer token` in the inline keyboard. The bot then waits for the next message, accepts either `ey...` or `Bearer ey...`, deletes that message, normalizes it, and saves it to `giga_user_secrets.bearer_token`.
 
 ## Debug Data
 
